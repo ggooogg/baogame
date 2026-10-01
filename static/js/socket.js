@@ -35,10 +35,21 @@ var socket = {
 				data = str.substring($s + 1);
 			}
 		}
-		// 被服务器主动关闭
+		// 被服务器主动关闭：通知监听方并真正断开，
+		// 否则连接还开着但 open=false，之后发出的消息会一直堆在队列里发不出去
 		if (name == "close") {
 			_this.open = false;
 			_this.error = data;
+			if (_this.listeners["close"]) {
+				try {
+					_this.listeners["close"](data);
+				} catch (e) {
+					console.log("listener error for close", e);
+				}
+			}
+			try {
+				_this.ws.close();
+			} catch (e) {}
 			return;
 		}
 		if (_this.listeners[name]) {

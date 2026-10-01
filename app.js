@@ -109,7 +109,8 @@ wss.on('connection', function (ws, request) {
 	var socket = {
 		emit: function (name, data) {
 			try {
-				var c = name + "$" + JSON.stringify(data || {}, function (key, val) {
+				// data 为字符串时按原样发送：Game.sendTick 已预先序列化并复用同一份字符串
+				var body = typeof data === 'string' ? data : JSON.stringify(data || {}, function (key, val) {
 					// 跳过反向引用字段，避免循环引用
 					if (key === 'game' || key === 'socket' || key === 'client' ||
 						key === 'targetMob' || key === 'targetItem' || key === 'AI') {
@@ -117,7 +118,7 @@ wss.on('connection', function (ws, request) {
 					}
 					return val;
 				});
-				ws.send(c);
+				ws.send(name + "$" + body);
 			} catch (e) {
 				console.log(e);
 			}
@@ -150,6 +151,11 @@ wss.on('connection', function (ws, request) {
 		} else {
 			var name = message.substring(0, $s);
 			var data = JSON.parse(message.substring($s + 1));
+		}
+		//心跳：与 Worker 端一致，直接回包用于测量延迟
+		if (name === 'ping') {
+			socket.emit('pong', data);
+			return;
 		}
 		socket.listeners[name] && socket.listeners[name](data);
 	});

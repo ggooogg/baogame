@@ -10,6 +10,7 @@ var app = Vue.createApp({
 		</div>
 		<div class="topbar-center">
 			<span class="tb-counter">玩家数：{{clientCount}}</span>
+			<span class="tb-ping" v-if="ping">延迟：{{ping}}ms</span>
 		</div>
 		<div class="topbar-right">
 			<div class="tb-notice-wrap">
@@ -111,6 +112,7 @@ var app = Vue.createApp({
 			clientCount: 0,
 			playerCount: 0,
 			maxUser: 6,
+			ping: 0,        // 与服务器的往返延迟（ms）
 			win: false,
 			logs: [],
 			noticeVisible: false,    // 新消息时短暂弹出3秒
@@ -154,7 +156,11 @@ function parseParam () {
 var param = parseParam();
 // 兜底：访问首页但未带 roomID 时，走自动选房（未满加入/全满新建）
 // Node 端 / 已重定向到 /join，此分支主要覆盖 Worker 端静态资源直出首页的情况
+// 跳转期间不能初始化连接：location.replace 后当前脚本仍会继续执行，
+// 否则会先连上默认房间再跳转，给房间留下一个没人操作的幽灵连接（占人数、拖慢 tick）
+var redirected = false;
 if (!param.roomID && location.pathname === '/') {
+	redirected = true;
 	location.replace('/join');
 }
 
@@ -210,7 +216,9 @@ var game = {
 
 
 function joining (team) {
-	if (!app.playerCount >= app.maxUser || app.playing) {return}
+	// 注意运算符优先级：原写法 !app.playerCount >= app.maxUser 等价于 (!playerCount) >= maxUser，
+	// 永远为 false，满房时仍能加入
+	if (app.playerCount >= app.maxUser || app.playing) {return}
 	localStorage.userName = app.myName;
 	p1.team = team;
 	socket.emit('join', {
@@ -266,6 +274,22 @@ window.addEventListener('resize', initViewPort);
 
 
 function initDone () {
+	//心跳：用于显示往返延迟，服务端在网关层直接回包，不进入游戏逻辑
+	setInterval(function () {
+		socket.emit('ping', Date.now());
+	}, 2000);
+	socket.on('pong', function (t) {
+		if (t) {
+			app.ping = Date.now() - t;
+		}
+	});
+	//被服务器主动关闭（房间不存在/已满）
+	socket.on('close', function (reason) {
+		notice('连接被关闭：' + (reason || '未知原因'));
+		setTimeout(function () {
+			location.href = './rooms';
+		}, 1000);
+	});
 	socket.emit('init', {
 		userName: app.myName
 	});
@@ -371,13 +395,6 @@ function initDone () {
 
 	socket.on('globalSync', function (data) {
 		if (data.structs) {
-			game.structsData = [];
-			for (var struct of data.structs) {
-				if (game.structsData[struct.y] == undefined) {
-					game.structsData[struct.y] = [];
-				}
-				game.structsData[struct.y][struct.x] = struct;
-			}
 			// 全量同步（sync.all()）返回 structs 数组：据此初始化 app.structs，
 			// 使后续增量同步（structs:0 / structs:1 ...）能找到对应目标对象
 			app.structs = data.structs.map(function (s) {
@@ -413,24 +430,11 @@ function initDone () {
 					old[(keys[1])].clean = false;
 				}
 			} else {
-				var value = data[key];
-				if (typeof value == "number" || typeof value == "string" || typeof value == "boolean") {
-					dest[key] = value;
-				} else {
-					dest[key] = value;
-				}
+				dest[key] = data[key];
 			}
 		}
 	}
 
-	var listeners = {
-		structs: function (oldVal, newVal) {
-			
-		},
-		struct_i: function (i, data) {
-
-		}
-	}
 	socket.begin(param.roomID);
 }
 
@@ -456,8 +460,6 @@ var imgUrls = {
 		"/item/grenade.png",
 	],
 	sign: "/tile/sign.png",
-	door: "/tile/door.png",
-	dooropen: "/tile/dooropen.png",
 	itemGate: "/tile/itemGate.png",
 	bomb: "/bomb.png",
 	arm: "/arm.png",
@@ -576,7 +578,8 @@ function drawDoor (ctx, struct) {
 }
 function drawStruct (ctx, struct) {
 	if (struct.type == "sign") {
-		if (!imgs.itemGate.sign) {return false}
+		// 原写法判断的是 imgs.itemGate.sign（恒为 undefined），导致牌子永远画不出来
+		if (!imgs.sign.complete) {return false}
 		ctx.drawImage(imgs.sign, struct.x * C.TW, P.h - (struct.y+1)*C.TH, C.TW, C.TH);
 	} else if (struct.type == "itemGate") {
 		if (!imgs.itemGate.complete) {return false}
@@ -596,22 +599,9 @@ function drawStructs (ctx) {
 		}
 		
 		ctx.clearRect((struct.x) * C.TW, P.h - (struct.y+1)*C.TH, C.TW , C.TH);
-		// if (game.structsData[struct.y] && game.structsData[struct.y][struct.x - 2]) {
-		// 	drawStruct(ctx, game.structsData[struct.y][struct.x - 2]);
-		// }
-		// if (game.structsData[struct.y] && game.structsData[struct.y][struct.x - 1]) {
-		// 	drawStruct(ctx, game.structsData[struct.y][struct.x - 1]);
-		// }
 		if (drawStruct(ctx, struct)) {
 			struct.clean = true;
 		}
-		// if (game.structsData[struct.y] && game.structsData[struct.y][struct.x + 1]) {
-		// 	drawStruct(ctx, game.structsData[struct.y][struct.x + 1]);
-		// }
-		// if (game.structsData[struct.y] && game.structsData[struct.y][struct.x + 2]) {
-		// 	drawStruct(ctx, game.structsData[struct.y][struct.x + 2]);
-		// }
-		
 	}
 	ctx.restore();
 }
@@ -904,4 +894,6 @@ document.addEventListener('click', function () {
 	app.helpExpanded = false;
 });
 
-initDone();
+if (!redirected) {
+	initDone();
+}

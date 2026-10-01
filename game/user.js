@@ -252,19 +252,23 @@ User.prototype.update = function () {
 		} else if (this.downDown && !this.upDown && this.y > this.pilla.y1*C.TH + 3) {
 			this.y -= 3;
 		}
-		if (this.leftPress) {
-			if (this.faceing != -1) {
-				this.faceing = -1;
-			} else {
-				this.vx = -2;
-				this.onPilla = false;
-			}
-		} else if (this.rightPress) {
-			if (this.faceing != 1) {
-				this.faceing = 1;
-			} else {
-				this.vx = 2;
-				this.onPilla = false;
+		// 梯子上按左右键跳下：先转身，再按一次（或继续按住）即可跳离梯子。
+		// 只按一下会先转身，避免方向相反时误摔；正在上下爬时不响应，防止误操作。
+		if (!this.upDown && !this.downDown) {
+			if (this.leftPress || this.leftDown) {
+				if (this.faceing != -1) {
+					this.faceing = -1;
+				} else {
+					this.vx = -2;
+					this.onPilla = false;
+				}
+			} else if (this.rightPress || this.rightDown) {
+				if (this.faceing != 1) {
+					this.faceing = 1;
+				} else {
+					this.vx = 2;
+					this.onPilla = false;
+				}
 			}
 		}
 	} else if (this.status == "standing") {

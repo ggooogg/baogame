@@ -3,6 +3,12 @@ main = "src/worker.js"
 compatibility_date = "2026-04-07"
 compatibility_flags = ["nodejs_compat"]
 
+# Room DO 的机房偏好：默认 auto（按第一位进入房间的玩家所在洲自动选择，
+# 见 src/constants.js 的 CONTINENT_HINT）。如需固定，可改成 apac / wnam / enam /
+# sam / weur / eeur / oc / afr / me，例如：
+# [vars]
+# ROOM_LOCATION = "apac"
+
 # 每个房间对应一个 Durable Object 实例
 [[durable_objects.bindings]]
 name = "ROOM"

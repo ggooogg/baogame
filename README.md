@@ -124,7 +124,7 @@ http://localhost:port/admin  可以进入管理界面，需要localStorage中设
 ## 架构
 
 - **主 Worker (`src/worker.js`)**：提供静态资源（`static/`、`build/` 下的 HTML/CSS/JS/图片）、HTTP 路由（`/createRoom`、`/roomsData`），并将 WebSocket 升级请求转发到对应房间。
-- **Room Durable Object (`src/room-do.js`)**：每个房间一个实例，持有 `game/Game` 实例，用 `ctx.setInterval` 驱动 17ms 游戏主循环，通过 Hibernatable WebSocket 维持连接。所有玩家掉线后自动停止循环并允许休眠。
+- **Room Durable Object (`src/room-do.js`)**：每个房间一个实例，持有 `game/Game` 实例，用 `setInterval` 驱动 17ms 游戏主循环，连接为常驻 WebSocket（不休眠，原因见下）。所有玩家掉线后自动停止循环并释放 Game。
 - **Lobby Durable Object (`src/lobby-do.js`)**：单例房间注册表，维护房间列表与在线人数（替代原 Node 版的内存 `rooms` 数组）。
 
 游戏核心逻辑（`game/` 目录）**完全复用**，仅做了两处解耦：
@@ -135,18 +135,52 @@ http://localhost:port/admin  可以进入管理界面，需要localStorage中设
 
 ```bash
 npm install
+npm run build             # 生成 static/js/vue.js（构建产物，被 .gitignore 忽略，不可省）
 npx wrangler dev
 # 打开 http://localhost:8787
 ```
 
-> 注意：`wrangler dev` 本地默认不下发 WebSocket 休眠，事件仍正常投递，可直接联机测试。
-
 ## 部署
 
 ```bash
+npm run build             # 同上，部署前必须执行，否则页面缺少 vue.js
 npx wrangler login        # 首次需登录 Cloudflare
 npm run deploy            # 等价于 wrangler deploy
 ```
+
+## 关于 WebSocket 休眠（重要）
+
+房间使用常驻 WebSocket（`ws.accept()`）而不是 Hibernatable WebSocket。
+
+原因是本游戏是 17ms 一帧的实时模拟：DO 一旦被驱逐，内存里的 `Game` 实例、玩家角色和主循环
+全部丢失，而客户端连接还开着 —— 表现就是"房间突然不动了，刷新重进才好"。
+常驻连接的代价是房间有人时按在线时长计费，换来的是状态不会丢。
+
+## 降低延迟
+
+1. **让房间落在离玩家最近的机房（最有效）**
+   `Room` DO 是单实例的，默认机房由 Cloudflare 分配，跨洲时 RTT 能差 200ms 以上。
+   现在会按**第一位进入房间的玩家所在洲**自动选择（见 `src/constants.js` 的 `CONTINENT_HINT`）。
+   需要固定机房时，在 `wrangler.toml` 加：
+
+   ```toml
+   [vars]
+   ROOM_LOCATION = "apac"   # apac / wnam / enam / sam / weur / eeur / oc / afr / me
+   ```
+
+2. **用自定义域名，不要长期用 `*.workers.dev`**
+   `workers.dev` 在部分地区（含中国大陆）解析慢甚至不可达；绑定自己的域名并接入 Cloudflare
+   才能走最近的边缘节点。
+
+3. **游戏内可实时看延迟**：顶栏会显示 `延迟：xx ms`（每 2 秒一次心跳测得的往返时间），
+   便于判断是机房太远还是网络本身的问题。
+
+4. **如果玩家主要在中国大陆**：Cloudflare 在中国大陆没有节点，且中国大陆访问 Cloudflare
+   的线路抖动较大，此时 Workers 并不是最优选 —— 建议用上面的 Node 私服部署一台离玩家近的
+   VPS（`node app.js`），延迟通常能低一个数量级。
+
+5. **每帧广播开销**：`Game.sendTick` 已把全房间共用的 users/items 每帧只序列化一次，
+   逐客户端只拼接字符串，房间人越多省得越多。
 
 部署后通过分配的 `*.workers.dev` 域名访问即可。`/admin` 管理界面需在浏览器 localStorage 设置 `code=管理员口令`（默认 `admin`，可用 `wrangler secret put ADMIN_CODE` 修改）。
 

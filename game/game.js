@@ -18,6 +18,8 @@ var Game = function (adminCode, maxUser, map, remove, autoTick) {
 	this.status = C.GAME_STATUS_INIT;
 	this.adminCode = adminCode;
 	this.mapConfig = map;
+	//最多玩家数量（client.js 的加入校验、前端"房间已满"提示都依赖它）
+	this.maxUser = maxUser;
 	//其他人
 	this.users = [];
 	//所有连接，包括ob
@@ -274,13 +276,8 @@ Game.prototype.update = function () {
 		}
 	}
 	//user更新
-	
-	var npcCount = 0;
 	for(let user of this.users) {
 		user.update();
-		if (user.npc) {
-			npcCount++;
-		}
 	};
 
 	//分发状态
@@ -302,6 +299,17 @@ Game.prototype.clean = function () {
 		}
 	}
 }
+// 序列化时跳过反向引用字段，避免循环引用（与 Node 端 app.js 行为一致）
+function stringify (data) {
+	return JSON.stringify(data, function (key, val) {
+		if (key === 'game' || key === 'socket' || key === 'client' ||
+			key === 'targetMob' || key === 'targetItem' || key === 'AI') {
+			return undefined;
+		}
+		return val;
+	});
+}
+
 Game.prototype.sendTick = function () {
 	var itemdata = [];
 	for (let item of this.items) {
@@ -320,6 +328,14 @@ Game.prototype.sendTick = function () {
 		entitydata.push(Pack.entityPack.encode(entity));
 	}
 
+	// 全房间共用的部分每帧只序列化一次，逐个客户端时只拼接字符串，
+	// 避免 N 个客户端把同一份 users/items 重复 stringify N 遍（房间人多时开销明显）
+	var userStr = stringify(userdata);
+	var itemStr = stringify(itemdata);
+	var entityStr = stringify(entitydata);
+	var clientStr = clientsdata.length ? stringify(clientsdata) : null;
+	var shared = '"users":' + userStr + ',"items":' + itemStr;
+
 	for (let client of this.clients) {
 		var p1 = client.p1 && client.p1.id;
 		var minedata = [];
@@ -329,21 +345,13 @@ Game.prototype.sendTick = function () {
 			}
 		};
 
-		if (client.admin) {
-			client.socket.emit('tick', {
-				users: userdata,
-				items: itemdata,
-				mines: minedata,
-				clients: clientsdata
-			});
-		} else {
-			client.socket.emit('tick', {
-				users: userdata,
-				items: itemdata,
-				mines: minedata,
-				entitys: entitydata
-			});
-		}
+		// 管理员看连接列表，普通玩家看投掷物
+		var extra = client.admin
+			? '"clients":' + (clientStr || '[]')
+			: '"entitys":' + entityStr;
+
+		client.socket.emit('tick',
+			'{' + shared + ',' + extra + ',"mines":' + stringify(minedata) + '}');
 	}
 
 

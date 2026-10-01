@@ -80,12 +80,17 @@ body {
 	background: #ff0;
 	color: #000;
 }
-.tb-counter {
+.tb-counter,
+.tb-ping {
 	border: 1px solid #999;
 	color: #ddd;
 	border-radius: 4px;
 	padding: 3px 10px;
 	background: rgba(255, 255, 255, .08);
+}
+.tb-ping {
+	margin-left: 6px;
+	color: #9f9;
 }
 .tb-changemap {
 	border-color: #0c0;

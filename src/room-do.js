@@ -1,58 +1,88 @@
 // Durable Object：每个房间一个实例
-// 负责持有 Game 实例、驱动游戏循环、管理 Hibernatable WebSocket 连接
+// 负责持有 Game 实例、驱动游戏循环、管理 WebSocket 连接
 import { DurableObject } from "cloudflare:workers";
 
 import Game from "../game/game.js";
+import { MAX_CLIENT, MAX_USER, TICK_MS } from "./constants.js";
+
+// 序列化时跳过反向引用字段，避免循环引用（与 Node 版 app.js 行为一致）
+function replacer(key, val) {
+	if (
+		key === "game" ||
+		key === "socket" ||
+		key === "client" ||
+		key === "targetMob" ||
+		key === "targetItem" ||
+		key === "AI"
+	) {
+		return undefined;
+	}
+	return val;
+}
 
 // 解析 "eventName$jsonData" 协议帧（与 Node 版 app.js、game/client.js 保持一致）
-// 入参 raw 可为字符串或 ArrayBuffer/二进制；返回 {name, data}
+// 入参 raw 可为字符串或 ArrayBuffer；返回 {name, data}，解析失败返回 null
 function parseMessage(raw) {
 	let message = raw;
 	if (typeof message !== "string") {
-		try { message = new TextDecoder().decode(message); } catch (e) { return null; }
+		try {
+			message = new TextDecoder().decode(message);
+		} catch (e) {
+			return null;
+		}
 	}
 	const idx = message.indexOf("$");
 	if (idx === -1) {
 		return { name: message, data: {} };
 	}
-	return {
-		name: message.substring(0, idx),
-		data: JSON.parse(message.substring(idx + 1)),
-	};
+	try {
+		return {
+			name: message.substring(0, idx),
+			data: JSON.parse(message.substring(idx + 1)),
+		};
+	} catch (e) {
+		return null;
+	}
 }
 
-// 把 Durable Object 的 Hibernatable WebSocket 包装成 game/client.js 期望的 socket 接口
-// 协议：消息格式为 "eventName$jsonData"，与原有 Node 版 app.js 完全一致。
-// 注意：Hibernatable WebSocket 下消息统一经 DO 的 webSocketMessage 回调进入 dispatch()，
-// 而非 ws 上的 addEventListener('message')（休眠后后者不再触发），故此处不绑定任何事件监听。
+// 把 WebSocket 包装成 game/client.js 期望的 socket 接口
+// 协议：消息格式为 "eventName$jsonData"，与原有 Node 版 app.js 完全一致
 function createSocket(ws, request) {
 	const socket = {
 		// 发送：eventName + "$" + JSON
-		// 与 Node 版 app.js 保持一致的序列化行为：跳过反向引用字段，避免循环引用
+		// data 为字符串时按原样发送（Game.sendTick 会预先序列化并复用同一份字符串）
 		emit: function (name, data) {
 			try {
-				var c = name + "$" + JSON.stringify(data || {}, function (key, val) {
-					if (key === 'game' || key === 'socket' || key === 'client' ||
-						key === 'targetMob' || key === 'targetItem' || key === 'AI') {
-						return undefined;
-					}
-					return val;
-				});
-				ws.send(c);
+				// 已关闭/正在关闭的连接直接跳过（readyState 缺失时按可用处理）
+				if (ws.readyState !== undefined && ws.readyState > 1) return;
+				const body =
+					typeof data === "string" ? data : JSON.stringify(data || {}, replacer);
+				ws.send(name + "$" + body);
 			} catch (e) {
-				console.log(e);
+				// 连接已断开，忽略
 			}
 		},
 		// 注册事件回调（由 game/client.js 在 connect() 中调用）
 		on: function (name, callback) {
 			this.listeners[name] = callback;
 		},
-		// 由 webSocketMessage 回调调用，解析并分发一条消息
+		// 由 message 事件回调调用，解析并分发一条消息
 		dispatch: function (raw) {
 			const msg = parseMessage(raw);
-			if (msg && socket.listeners[msg.name]) {
+			if (!msg) return;
+			// 心跳：直接在网关层回包，不进入游戏逻辑（用于客户端测延迟）
+			if (msg.name === "ping") {
+				socket.emit("pong", msg.data);
+				return;
+			}
+			if (socket.listeners[msg.name]) {
 				socket.listeners[msg.name](msg.data);
 			}
+		},
+		close: function () {
+			try {
+				ws.close(1000, "bye");
+			} catch (e) {}
 		},
 		ip: request.headers.get("cf-connecting-ip") || "unknown",
 		listeners: {},
@@ -67,51 +97,72 @@ export class Room extends DurableObject {
 		this.env = env;
 		this.game = null;
 		this.tickTimer = null;
+		this.roomID = null;
 		this.adminCode = env.ADMIN_CODE || "admin";
+		// ws -> socket，连接关闭时用于反查并移除客户端
+		this.sockets = new Map();
+	}
+
+	// 向 Lobby 查询本房间类型（ws 连接 URL 不带 type 参数）
+	async lookupRoomType(roomID) {
+		if (!this.env || !this.env.LOBBY || !roomID) return "";
+		try {
+			const lobby = this.env.LOBBY.get(this.env.LOBBY.idFromName("global"));
+			const res = await lobby.fetch(
+				new Request("https://lobby/lookup?roomID=" + encodeURIComponent(roomID))
+			);
+			if (res.ok) return await res.text();
+		} catch (e) {
+			console.log("lookup roomType failed", e);
+		}
+		return "";
 	}
 
 	// 确保 Game 实例存在并启动游戏循环
-	// roomType 由 Lobby 查询得到（ws 连接 URL 不带 type 参数）
 	// 返回 true 表示 Game 就绪，false 表示房间未注册（与 Node 端 app.js 拒绝未找到房间行为一致）
 	async ensureGame(roomID) {
 		if (this.game) return true;
-		const maxUser = 6;
-		// 向 Lobby 查询本 roomID 对应的房间类型
-		let roomType = "";
-		if (this.env && this.env.LOBBY && roomID) {
-			try {
-				const lobbyId = this.env.LOBBY.idFromName("global");
-				const lobby = this.env.LOBBY.get(lobbyId);
-				const res = await lobby.fetch(
-					new Request("https://lobby/lookup?roomID=" + encodeURIComponent(roomID))
-				);
-				if (res.ok) {
-					roomType = await res.text();
-				}
-			} catch (e) {
-				console.log("lookup roomType failed", e);
-			}
-		}
-		// 房间未注册：拒绝连接（与 Node 端 app.js findRoom 未找到时 emit('close') + ws.close() 一致）
-		if (!roomType) {
-			return false;
-		}
+		const roomType = await this.lookupRoomType(roomID);
+		if (!roomType) return false;
+		this.roomID = roomID;
 		// autoTick=false：游戏主循环由本 DO 显式驱动（不依赖 Game 内部 setInterval）
-		this.game = new Game(this.adminCode, maxUser, roomType, null, false);
+		this.game = new Game(this.adminCode, MAX_USER, roomType, null, false);
+		this.startLoop();
+		return true;
+	}
+
+	// 启动 17ms 主循环；已启动则跳过
+	startLoop() {
+		if (this.tickTimer) return;
 		this.tickTimer = setInterval(() => {
 			if (this.game && this.game.clients.length > 0) {
 				this.game.update();
 			}
-		}, 17);
-		return true;
+		}, TICK_MS);
+	}
+
+	stopLoop() {
+		if (this.tickTimer) {
+			clearInterval(this.tickTimer);
+			this.tickTimer = null;
+		}
+	}
+
+	// 接受连接后立即关闭并给出原因（房间不存在 / 已满）
+	reject(reason) {
+		const pair = new WebSocketPair();
+		const [client, server] = Object.values(pair);
+		server.accept();
+		server.send("close$" + JSON.stringify(reason));
+		server.close();
+		return new Response(null, { status: 101, webSocket: client });
 	}
 
 	async fetch(request) {
 		const url = new URL(request.url);
 
 		// 仅处理 WebSocket 升级请求
-		const upgradeHeader = request.headers.get("Upgrade");
-		if (upgradeHeader !== "websocket") {
+		if (request.headers.get("Upgrade") !== "websocket") {
 			return new Response("Expected WebSocket connection", { status: 426 });
 		}
 
@@ -119,97 +170,69 @@ export class Room extends DurableObject {
 		const UUID = url.searchParams.get("UUID") || String(Math.random());
 
 		const gameReady = await this.ensureGame(roomID);
-		// 房间未注册：接受 WS 后立即发送 close 并断开（与 Node 端 app.js 行为一致）
 		if (!gameReady) {
-			const webSocketPair = new WebSocketPair();
-			const [client, server] = Object.values(webSocketPair);
-			this.ctx.acceptWebSocket(server);
-			server.send('close$"未找到房间"');
-			server.close();
-			return new Response(null, { status: 101, webSocket: client });
+			return this.reject("未找到房间");
 		}
-		const roomType = this.game && this.game.mapConfig ? this.game.mapConfig : "大乱斗";
-
-		// 与 Node 端 app.js 一致：房间最多 30 个连接
-		if (this.game.clients.length > 30) {
-			const webSocketPair = new WebSocketPair();
-			const [client, server] = Object.values(webSocketPair);
-			this.ctx.acceptWebSocket(server);
-			server.send('close$"房间链接已满"');
-			server.close();
-			return new Response(null, { status: 101, webSocket: client });
+		if (this.game.clients.length >= MAX_CLIENT) {
+			return this.reject("房间链接已满");
 		}
 
-		const webSocketPair = new WebSocketPair();
-		const [client, server] = Object.values(webSocketPair);
+		const pair = new WebSocketPair();
+		const [client, server] = Object.values(pair);
 
-		// 持久化每连接数据，跨休眠保留
-		server.serializeAttachment({ roomID, UUID, roomType });
-
-		// 使用 Hibernatable WebSocket，连接空闲时 DO 可被回收而不断开连接
-		this.ctx.acceptWebSocket(server);
+		// 使用常驻连接（ws.accept）而非 Hibernatable WebSocket：
+		// 游戏是 17ms 一帧的实时模拟，DO 一旦被驱逐，内存里的 Game 实例与主循环都会丢失，
+		// 之后进入房间的玩家会拿到一个"死房间"（无 tick、指令被丢弃），必须刷新重进才恢复。
+		// 常驻连接的代价是房间有人时按在线时长计费，换来的是状态与循环不会丢。
+		server.accept();
 
 		const socket = createSocket(server, request);
-		this.game.addClient(socket, UUID);
-		this.notifyLobby(roomID);
+		server.addEventListener("message", (event) => {
+			socket.dispatch(event.data);
+		});
+		// 连接断开（含 DO 被驱逐导致的断开）：清理客户端，无人时停循环让 DO 可回收
+		server.addEventListener("close", () => this.onClose(server));
+		server.addEventListener("error", () => this.onClose(server));
 
-		// 保存 socket 引用，供 webSocketMessage 休眠后分发消息
-		this.sockets = this.sockets || new Map();
 		this.sockets.set(server, socket);
+		this.game.addClient(socket, UUID);
+		this.notifyLobby();
 
 		return new Response(null, { status: 101, webSocket: client });
 	}
 
-	async webSocketMessage(ws, message) {
-		// Hibernatable WebSocket 下，所有入站消息都经由本回调进入 dispatch()
-		const socket = this.sockets && this.sockets.get(ws);
-		if (socket) {
-			socket.dispatch(message);
-		}
-	}
-
-	async webSocketClose(ws, code, reason, wasClean) {
-		// 连接关闭：从游戏中移除对应客户端
-		const socket = this.sockets && this.sockets.get(ws);
-		if (this.game && socket) {
+	onClose(ws) {
+		const socket = this.sockets.get(ws);
+		this.sockets.delete(ws);
+		if (socket && this.game) {
 			this.game.removeClient(socket);
 		}
-		if (this.sockets) {
-			this.sockets.delete(ws);
-		}
-		ws.close(code, reason);
-
-		// 所有连接断开后停止游戏循环，允许 DO 休眠
-		if (this.game && this.game.clients.length === 0 && this.tickTimer) {
-			const attachment = ws.deserializeAttachment() || {};
-			this.notifyLobby(attachment.roomID);
-			clearInterval(this.tickTimer);
-			this.tickTimer = null;
+		// 所有连接断开后停止游戏循环并释放 Game，允许 DO 被回收
+		if (this.sockets.size === 0) {
+			this.notifyLobby();
+			this.stopLoop();
 			this.game = null;
 		}
 	}
 
 	// 通知 Lobby 更新本房间人数
-	notifyLobby(roomID) {
-		if (!roomID || !this.env || !this.env.LOBBY) return;
+	notifyLobby() {
+		if (!this.roomID || !this.env || !this.env.LOBBY) return;
 		try {
-			const id = this.env.LOBBY.idFromName("global");
-			const lobby = this.env.LOBBY.get(id);
+			const lobby = this.env.LOBBY.get(this.env.LOBBY.idFromName("global"));
 			const users = this.game ? this.game.clients.length : 0;
-			lobby.fetch(
-				new Request(
-					"https://lobby/updateCount?roomID=" +
-						encodeURIComponent(roomID) +
-						"&users=" +
-						users
+			lobby
+				.fetch(
+					new Request(
+						"https://lobby/updateCount?roomID=" +
+							encodeURIComponent(this.roomID) +
+							"&users=" +
+							users
+					)
 				)
-			).catch(() => {});
+				.catch(() => {});
 		} catch (e) {
 			console.log("notifyLobby failed", e);
 		}
-	}
-
-	async webSocketError(ws, error) {
-		console.log("websocket error", error);
 	}
 }
